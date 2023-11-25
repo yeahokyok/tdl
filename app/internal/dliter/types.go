@@ -41,4 +41,5 @@ type fileTemplate struct {
 	FileName     string
 	FileSize     string
 	DownloadDate int64
+	AuthorID     int64
 }

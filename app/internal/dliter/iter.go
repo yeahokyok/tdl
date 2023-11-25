@@ -113,6 +113,9 @@ func (iter *Iter) item(ctx context.Context, i, j int) (*downloader.Item, error) 
 	}
 
 	buf := bytes.Buffer{}
+
+	authorPeer, _ := message.GetFromID()
+	AuthorPeerID := utils.Telegram.GetPeerID(authorPeer)
 	err = iter.template.Execute(&buf, &fileTemplate{
 		DialogID:     id,
 		MessageID:    message.ID,
@@ -120,6 +123,7 @@ func (iter *Iter) item(ctx context.Context, i, j int) (*downloader.Item, error) 
 		FileName:     item.Name,
 		FileSize:     utils.Byte.FormatBinaryBytes(item.Size),
 		DownloadDate: time.Now().Unix(),
+		AuthorID:     AuthorPeerID,
 	})
 	if err != nil {
 		return nil, err
