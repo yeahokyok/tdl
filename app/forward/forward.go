@@ -10,18 +10,20 @@ import (
 	"github.com/antonmedv/expr"
 	"github.com/antonmedv/expr/vm"
 	"github.com/go-faster/errors"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 
 	"github.com/iyear/tdl/app/internal/tctx"
-	"github.com/iyear/tdl/app/internal/tgc"
 	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/dcpool"
 	"github.com/iyear/tdl/pkg/forwarder"
+	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/prog"
 	"github.com/iyear/tdl/pkg/storage"
+	"github.com/iyear/tdl/pkg/tclient"
 	"github.com/iyear/tdl/pkg/texpr"
 	"github.com/iyear/tdl/pkg/tmessage"
 	"github.com/iyear/tdl/pkg/utils"
@@ -35,7 +37,7 @@ type Options struct {
 	DryRun bool
 }
 
-func Run(ctx context.Context, opts Options) error {
+func Run(ctx context.Context, c *telegram.Client, kvd kv.KV, opts Options) (rerr error) {
 	if opts.To == "-" {
 		fg := texpr.NewFieldsGetter(nil)
 
@@ -48,51 +50,51 @@ func Run(ctx context.Context, opts Options) error {
 		return nil
 	}
 
-	c, kvd, err := tgc.NoLogin(ctx)
-	if err != nil {
-		return err
-	}
 	ctx = tctx.WithKV(ctx, kvd)
 
-	return tgc.RunWithAuth(ctx, c, func(ctx context.Context) (rerr error) {
-		middlewares, err := tgc.NewDefaultMiddlewares(ctx)
-		if err != nil {
-			return errors.Wrap(err, "create middlewares")
-		}
+	pool := dcpool.NewPool(c,
+		int64(viper.GetInt(consts.FlagPoolSize)),
+		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
+	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
 
-		pool := dcpool.NewPool(c, int64(viper.GetInt(consts.FlagPoolSize)), middlewares...)
-		defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
+	ctx = tctx.WithPool(ctx, pool)
 
-		ctx = tctx.WithPool(ctx, pool)
+	dialogs, err := collectDialogs(ctx, opts.From)
+	if err != nil {
+		return errors.Wrap(err, "collect dialogs")
+	}
 
-		dialogs, err := collectDialogs(ctx, opts.From)
-		if err != nil {
-			return errors.Wrap(err, "collect dialogs")
-		}
+	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
+	to, err := resolveDestPeer(ctx, manager, opts.To)
+	if err != nil {
+		return errors.Wrap(err, "resolve dest peer")
+	}
 
-		to, err := resolveDestPeer(ctx, manager, opts.To)
-		if err != nil {
-			return errors.Wrap(err, "resolve dest peer")
-		}
+	fwProgress := prog.New(pw.FormatNumber)
+	fwProgress.SetNumTrackersExpected(totalMessages(dialogs))
+	prog.EnablePS(ctx, fwProgress)
 
-		fwProgress := prog.New(pw.FormatNumber)
-
-		fw := forwarder.New(forwarder.Options{
-			Pool:     pool,
-			Iter:     newIter(manager, pool, to, dialogs),
-			Silent:   opts.Silent,
-			DryRun:   opts.DryRun,
-			Mode:     opts.Mode,
-			Progress: newProgress(fwProgress),
-		})
-
-		go fwProgress.Render()
-		defer prog.Wait(fwProgress)
-
-		return fw.Forward(ctx)
+	fw := forwarder.New(forwarder.Options{
+		Pool: pool,
+		Iter: newIter(iterOptions{
+			manager: manager,
+			pool:    pool,
+			to:      to,
+			dialogs: dialogs,
+			mode:    opts.Mode,
+			silent:  opts.Silent,
+			dryRun:  opts.DryRun,
+		}),
+		Progress: newProgress(fwProgress),
+		PartSize: viper.GetInt(consts.FlagPartSize),
+		Threads:  viper.GetInt(consts.FlagThreads),
 	})
+
+	go fwProgress.Render()
+	defer prog.Wait(ctx, fwProgress)
+
+	return fw.Forward(ctx)
 }
 
 func collectDialogs(ctx context.Context, input []string) ([]*tmessage.Dialog, error) {
@@ -148,4 +150,12 @@ func resolveDestPeer(ctx context.Context, manager *peers.Manager, input string) 
 
 	// text
 	return compile(input)
+}
+
+func totalMessages(dialogs []*tmessage.Dialog) int {
+	var total int
+	for _, d := range dialogs {
+		total += len(d.Messages)
+	}
+	return total
 }

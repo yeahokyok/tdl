@@ -191,7 +191,7 @@ func (t telegram) GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.In
 
 	// check if message is deleted
 	if m.GetID() != msg {
-		return nil, errors.Errorf("message %d may be deleted", msg)
+		return nil, errors.Errorf("the message %d/%d may be deleted", t.GetInputPeerID(peer), msg)
 	}
 
 	return m, nil
@@ -247,4 +247,31 @@ func (t telegram) GetGroupedMessages(ctx context.Context, c *tg.Client, peer tg.
 	}
 
 	return messages, nil
+}
+
+var threadsLevels = []struct {
+	threads int
+	size    int64
+}{
+	{1, 1 << 20},
+	{2, 5 << 20},
+	{4, 20 << 20},
+	{8, 50 << 20},
+}
+
+func (t telegram) BestThreads(size int64, max int) int {
+	// Get best threads num for download, based on file size
+	for _, thread := range threadsLevels {
+		if size < thread.size {
+			return min(thread.threads, max)
+		}
+	}
+	return max
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

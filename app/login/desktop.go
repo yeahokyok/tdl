@@ -9,6 +9,7 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
+	"github.com/go-faster/errors"
 	"github.com/gotd/td/session"
 	tdtdesktop "github.com/gotd/td/session/tdesktop"
 	"github.com/spf13/viper"
@@ -17,6 +18,7 @@ import (
 	"github.com/iyear/tdl/pkg/key"
 	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/storage"
+	"github.com/iyear/tdl/pkg/tclient"
 	"github.com/iyear/tdl/pkg/tdesktop"
 	"github.com/iyear/tdl/pkg/tpath"
 	"github.com/iyear/tdl/pkg/utils"
@@ -24,20 +26,12 @@ import (
 
 const tdata = "tdata"
 
-type Options struct {
-	Desktop  string
-	Passcode string
-}
-
-func Desktop(ctx context.Context, opts *Options) error {
+func Desktop(ctx context.Context, opts Options) error {
 	ns := viper.GetString(consts.FlagNamespace)
 
-	kvd, err := kv.New(kv.Options{
-		Path: consts.KVPath,
-		NS:   ns,
-	})
+	kvd, err := kv.From(ctx).Open(ns)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "open kv")
 	}
 
 	desktop, err := findDesktop(opts.Desktop)
@@ -80,7 +74,7 @@ func Desktop(ctx context.Context, opts *Options) error {
 		return err
 	}
 
-	if err = kvd.Set(key.App(), []byte(consts.AppDesktop)); err != nil {
+	if err = kvd.Set(key.App(), []byte(tclient.AppDesktop)); err != nil {
 		return err
 	}
 

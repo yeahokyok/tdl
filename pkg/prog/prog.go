@@ -1,6 +1,7 @@
 package prog
 
 import (
+	"context"
 	"time"
 
 	"github.com/fatih/color"
@@ -13,15 +14,13 @@ func New(formatter progress.UnitsFormatter) progress.Writer {
 	pw := progress.NewWriter()
 	pw.SetAutoStop(false)
 
-	width := 50
+	width := 100
 	if size, err := tsize.GetSize(); err == nil {
 		width = size.Width
 	}
-	if width > 100 {
-		width = 100
-	}
-	pw.SetTrackerLength(width / 3)
-	pw.SetMessageWidth(width * 2 / 3)
+	width -= 50 // tail length
+	pw.SetTrackerLength(width / 5)
+	pw.SetMessageWidth(width * 3 / 5)
 	pw.SetStyle(progress.StyleDefault)
 	pw.SetTrackerPosition(progress.PositionRight)
 	pw.SetUpdateFrequency(time.Millisecond * 100)
@@ -42,11 +41,16 @@ func New(formatter progress.UnitsFormatter) progress.Writer {
 	return pw
 }
 
-func Wait(pw progress.Writer) {
+func Wait(ctx context.Context, pw progress.Writer) {
 	for pw.IsRenderInProgress() {
-		if pw.LengthActive() == 0 {
-			pw.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if pw.LengthActive() == 0 {
+				pw.Stop()
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -2,7 +2,6 @@ package forwarder
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"time"
 
@@ -11,10 +10,9 @@ import (
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	"github.com/spf13/viper"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/dcpool"
 	"github.com/iyear/tdl/pkg/logger"
 	"github.com/iyear/tdl/pkg/tmedia"
@@ -27,36 +25,28 @@ import (
 // ENUM(direct, clone)
 type Mode int
 
-type Iter interface {
-	Next(ctx context.Context) bool
-	Value() *Elem
-	Err() error
-}
-
-type Elem struct {
-	From peers.Peer
-	Msg  *tg.Message
-	To   peers.Peer
-}
-
 type Options struct {
 	Pool     dcpool.Pool
+	PartSize int
+	Threads  int
 	Iter     Iter
-	Silent   bool
-	DryRun   bool
-	Mode     Mode
 	Progress Progress
 }
 
 type Forwarder struct {
-	sent map[[2]int64]struct{} // used to filter grouped messages which are already sent
+	sent map[tuple]struct{} // used to filter grouped messages which are already sent
 	rand *rand.Rand
 	opts Options
 }
 
+type tuple struct {
+	from int64
+	msg  int
+}
+
 func New(opts Options) *Forwarder {
 	return &Forwarder{
-		sent: make(map[[2]int64]struct{}),
+		sent: make(map[tuple]struct{}),
 		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 		opts: opts,
 	}
@@ -65,25 +55,29 @@ func New(opts Options) *Forwarder {
 func (f *Forwarder) Forward(ctx context.Context) error {
 	for f.opts.Iter.Next(ctx) {
 		elem := f.opts.Iter.Value()
-		if _, ok := f.sent[f.sentTuple(elem.From, elem.Msg)]; ok {
+		if _, ok := f.sent[f.tuple(elem.From(), elem.Msg())]; ok {
 			// skip grouped messages
 			continue
 		}
 
-		if _, ok := elem.Msg.GetGroupedID(); ok {
-			grouped, err := utils.Telegram.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From.InputPeer(), elem.Msg)
+		if _, ok := elem.Msg().GetGroupedID(); ok {
+			grouped, err := utils.Telegram.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From().InputPeer(), elem.Msg())
 			if err != nil {
 				continue
 			}
 
-			if err = f.forwardMessage(ctx, elem.From, elem.To, elem.Msg, grouped...); err != nil {
+			if err = f.forwardMessage(ctx, elem, grouped...); err != nil {
 				continue
 			}
 
 			continue
 		}
 
-		if err := f.forwardMessage(ctx, elem.From, elem.To, elem.Msg); err != nil {
+		if err := f.forwardMessage(ctx, elem); err != nil {
+			// canceled by user, so we directly return error to stop all
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
 			continue
 		}
 	}
@@ -91,28 +85,29 @@ func (f *Forwarder) Forward(ctx context.Context) error {
 	return f.opts.Iter.Err()
 }
 
-func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg *tg.Message, grouped ...*tg.Message) (rerr error) {
-	meta := &ProgressMeta{
-		From: from,
-		Msg:  msg,
-		To:   to,
-	}
-
-	f.opts.Progress.OnAdd(meta)
+func (f *Forwarder) forwardMessage(ctx context.Context, elem Elem, grouped ...*tg.Message) (rerr error) {
+	f.opts.Progress.OnAdd(elem)
 	defer func() {
-		f.sent[f.sentTuple(from, msg)] = struct{}{}
+		f.sent[f.tuple(elem.From(), elem.Msg())] = struct{}{}
 
 		// grouped message also should be marked as sent
 		for _, m := range grouped {
-			f.sent[f.sentTuple(from, m)] = struct{}{}
+			f.sent[f.tuple(elem.From(), m)] = struct{}{}
 		}
-		f.opts.Progress.OnDone(meta, rerr)
+		f.opts.Progress.OnDone(elem, rerr)
 	}()
 
 	log := logger.From(ctx).With(
-		zap.Int64("from", from.ID()),
-		zap.Int64("to", to.ID()),
-		zap.Int("message", msg.ID))
+		zap.Int64("from", elem.From().ID()),
+		zap.Int64("to", elem.To().ID()),
+		zap.Int("message", elem.Msg().ID))
+
+	// used for clone progress
+	totalSize, err := mediaSizeSum(elem.Msg(), grouped...)
+	if err != nil {
+		return errors.Wrap(err, "media total size")
+	}
+	done := atomic.NewInt64(0)
 
 	forwardTextOnly := func(msg *tg.Message) error {
 		if msg.Message == "" {
@@ -120,12 +115,12 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 		}
 		req := &tg.MessagesSendMessageRequest{
 			NoWebpage:              false,
-			Silent:                 f.opts.Silent,
+			Silent:                 elem.AsSilent(),
 			Background:             false,
 			ClearDraft:             false,
 			Noforwards:             false,
 			UpdateStickersetsOrder: false,
-			Peer:                   to.InputPeer(),
+			Peer:                   elem.To().InputPeer(),
 			ReplyTo:                nil,
 			Message:                msg.Message,
 			RandomID:               f.rand.Int63(),
@@ -136,7 +131,7 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 		}
 		req.SetFlags()
 
-		if _, err := f.forwardClient(ctx).MessagesSendMessage(ctx, req); err != nil {
+		if _, err := f.forwardClient(ctx, elem).MessagesSendMessage(ctx, req); err != nil {
 			return errors.Wrap(err, "send message")
 		}
 		return nil
@@ -154,7 +149,7 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 
 		// we should clone photo and document via re-upload, it will be banned if we forward it directly.
 		// but other media can be forwarded directly via copy
-		if (!protectedDialog(from) && !protectedMessage(msg)) || !photoOrDocument(msg.Media) {
+		if (!protectedDialog(elem.From()) && !protectedMessage(msg)) || !photoOrDocument(msg.Media) {
 			media, ok := tmedia.ConvInputMedia(msg.Media)
 			if !ok {
 				return nil, errors.Errorf("can't convert message %d to input class directly", msg.ID)
@@ -165,25 +160,28 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 		media, ok := tmedia.GetMedia(msg)
 		if !ok {
 			log.Warn("Can't get media from message",
-				zap.Int64("peer", from.ID()),
+				zap.Int64("peer", elem.From().ID()),
 				zap.Int("message", msg.ID))
 
 			// unsupported re-upload media
 			return nil, errors.Errorf("unsupported media %T", msg.Media)
 		}
 
-		mediaFile, err := f.CloneMedia(ctx, CloneOptions{
-			Media:    media,
-			PartSize: viper.GetInt(consts.FlagPartSize),
-			Progress: uploadProgress{
-				meta:     meta,
+		mediaFile, err := f.cloneMedia(ctx, cloneOptions{
+			elem:  elem,
+			media: media,
+			progress: &wrapProgress{
+				elem:     elem,
 				progress: f.opts.Progress,
+				done:     done,
+				total:    totalSize * 2,
 			},
-		})
+		}, elem.AsDryRun())
 		if err != nil {
 			return nil, errors.Wrap(err, "clone media")
 		}
 
+		var inputMedia tg.InputMediaClass
 		// now we only have to process cloned photo or document
 		switch m := msg.Media.(type) {
 		case *tg.MessageMediaPhoto:
@@ -193,25 +191,12 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 				TTLSeconds: m.TTLSeconds,
 			}
 			photo.SetFlags()
-			return photo, nil
+
+			inputMedia = photo
 		case *tg.MessageMediaDocument:
 			doc, ok := m.Document.AsNotEmpty()
 			if !ok {
 				return nil, errors.Errorf("empty document %d", msg.ID)
-			}
-
-			thumb, ok := tmedia.GetDocumentThumb(doc)
-			if !ok {
-				return nil, errors.Errorf("empty document thumb %d", msg.ID)
-			}
-
-			thumbFile, err := f.CloneMedia(ctx, CloneOptions{
-				Media:    thumb,
-				PartSize: viper.GetInt(consts.FlagPartSize),
-				Progress: nopProgress{},
-			})
-			if err != nil {
-				return nil, errors.Wrap(err, "clone thumb")
 			}
 
 			document := &tg.InputMediaUploadedDocument{
@@ -219,27 +204,57 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 				ForceFile:    false, // do not set
 				Spoiler:      m.Spoiler,
 				File:         mediaFile,
-				Thumb:        thumbFile,
 				MimeType:     doc.MimeType,
 				Attributes:   doc.Attributes,
 				Stickers:     nil, // do not set
-				TTLSeconds:   m.TTLSeconds,
+				TTLSeconds:   0,   // do not set
 			}
+
+			if thumb, ok := tmedia.GetDocumentThumb(doc); ok {
+				thumbFile, err := f.cloneMedia(ctx, cloneOptions{
+					elem:     elem,
+					media:    thumb,
+					progress: nopProgress{},
+				}, elem.AsDryRun())
+				if err != nil {
+					return nil, errors.Wrap(err, "clone thumb")
+				}
+
+				document.Thumb = thumbFile
+			}
+
 			document.SetFlags()
 
-			return document, nil
+			inputMedia = document
 		default:
 			return nil, errors.Errorf("unsupported media %T", msg.Media)
 		}
+
+		// note that they must be separately uploaded using messages uploadMedia first,
+		// using raw inputMediaUploaded* constructors is not supported.
+		messageMedia, err := f.forwardClient(ctx, elem).MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{
+			Peer:  elem.To().InputPeer(),
+			Media: inputMedia,
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "upload media")
+		}
+
+		inputMedia, ok = tmedia.ConvInputMedia(messageMedia)
+		if !ok && !elem.AsDryRun() {
+			return nil, errors.Errorf("can't convert uploaded media to input class")
+		}
+
+		return inputMedia, nil
 	}
 
-	switch f.opts.Mode {
+	switch elem.Mode() {
 	case ModeDirect:
 		// it can be forwarded via API
-		if !protectedDialog(from) && !protectedMessage(msg) {
-			builder := message.NewSender(f.forwardClient(ctx)).
-				To(to.InputPeer()).CloneBuilder()
-			if f.opts.Silent {
+		if !protectedDialog(elem.From()) && !protectedMessage(elem.Msg()) {
+			builder := message.NewSender(f.forwardClient(ctx, elem)).
+				To(elem.To().InputPeer()).CloneBuilder()
+			if elem.AsSilent() {
 				builder = builder.Silent()
 			}
 
@@ -249,14 +264,14 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 					ids = append(ids, m.ID)
 				}
 
-				if _, err := builder.ForwardIDs(from.InputPeer(), ids[0], ids[1:]...).Send(ctx); err != nil {
+				if _, err := builder.ForwardIDs(elem.From().InputPeer(), ids[0], ids[1:]...).Send(ctx); err != nil {
 					goto fallback
 				}
 
 				return nil
 			}
 
-			if _, err := builder.ForwardIDs(from.InputPeer(), msg.ID).Send(ctx); err != nil {
+			if _, err := builder.ForwardIDs(elem.From().InputPeer(), elem.Msg().ID).Send(ctx); err != nil {
 				goto fallback
 			}
 			return nil
@@ -280,67 +295,71 @@ func (f *Forwarder) forwardMessage(ctx context.Context, from, to peers.Peer, msg
 					Entities: gm.Entities,
 				}
 				single.SetFlags()
+
 				media = append(media, single)
 			}
 
 			if len(media) > 0 {
 				req := &tg.MessagesSendMultiMediaRequest{
-					Silent:                 f.opts.Silent,
+					Silent:                 elem.AsSilent(),
 					Background:             false,
 					ClearDraft:             false,
 					Noforwards:             false,
 					UpdateStickersetsOrder: false,
-					Peer:                   to.InputPeer(),
+					Peer:                   elem.To().InputPeer(),
 					ReplyTo:                nil,
 					MultiMedia:             media,
 					ScheduleDate:           0,
 					SendAs:                 nil,
 				}
 				req.SetFlags()
-				if _, err := f.forwardClient(ctx).MessagesSendMultiMedia(ctx, req); err != nil {
+				if _, err := f.forwardClient(ctx, elem).MessagesSendMultiMedia(ctx, req); err != nil {
 					return errors.Wrap(err, "send multi media")
 				}
 				return nil
 			}
 
-			return forwardTextOnly(msg)
+			return forwardTextOnly(elem.Msg())
 		}
 
-		media, err := convForwardedMedia(msg)
+		media, err := convForwardedMedia(elem.Msg())
 		if err != nil {
 			log.Debug("Can't convert forwarded media", zap.Error(err))
-			return forwardTextOnly(msg)
+			return forwardTextOnly(elem.Msg())
 		}
 		// send text copy with forwarded media
 		req := &tg.MessagesSendMediaRequest{
-			Silent:                 f.opts.Silent,
+			Silent:                 elem.AsSilent(),
 			Background:             false,
 			ClearDraft:             false,
 			Noforwards:             false,
 			UpdateStickersetsOrder: false,
-			Peer:                   to.InputPeer(),
+			Peer:                   elem.To().InputPeer(),
 			ReplyTo:                nil,
 			Media:                  media,
-			Message:                msg.Message,
+			Message:                elem.Msg().Message,
 			RandomID:               rand.Int63(),
-			ReplyMarkup:            msg.ReplyMarkup,
-			Entities:               msg.Entities,
+			ReplyMarkup:            elem.Msg().ReplyMarkup,
+			Entities:               elem.Msg().Entities,
 			ScheduleDate:           0,
 			SendAs:                 nil,
 		}
 		req.SetFlags()
 
-		if _, err := f.forwardClient(ctx).MessagesSendMedia(ctx, req); err != nil {
+		if _, err := f.forwardClient(ctx, elem).MessagesSendMedia(ctx, req); err != nil {
 			return errors.Wrap(err, "send single media")
 		}
 		return nil
 	}
 
-	return fmt.Errorf("unknown mode: %s", f.opts.Mode)
+	return errors.Errorf("unsupported mode %v", elem.Mode())
 }
 
-func (f *Forwarder) sentTuple(peer peers.Peer, msg *tg.Message) [2]int64 {
-	return [2]int64{peer.ID(), int64(msg.ID)}
+func (f *Forwarder) tuple(peer peers.Peer, msg *tg.Message) tuple {
+	return tuple{
+		from: peer.ID(),
+		msg:  msg.ID,
+	}
 }
 
 type nopInvoker struct{}
@@ -349,8 +368,26 @@ func (n nopInvoker) Invoke(_ context.Context, _ bin.Encoder, _ bin.Decoder) erro
 	return nil
 }
 
-func (f *Forwarder) forwardClient(ctx context.Context) *tg.Client {
-	if f.opts.DryRun {
+type nopProgress struct{}
+
+func (nopProgress) add(_ int64) {}
+
+type wrapProgress struct {
+	elem     Elem
+	progress ProgressClone
+	done     *atomic.Int64
+	total    int64
+}
+
+func (w *wrapProgress) add(n int64) {
+	w.progress.OnClone(w.elem, ProgressState{
+		Done:  w.done.Add(n),
+		Total: w.total,
+	})
+}
+
+func (f *Forwarder) forwardClient(ctx context.Context, elem Elem) *tg.Client {
+	if elem.AsDryRun() {
 		return tg.NewClient(nopInvoker{})
 	}
 
@@ -379,4 +416,26 @@ func photoOrDocument(media tg.MessageMediaClass) bool {
 	default:
 		return false
 	}
+}
+
+func mediaSizeSum(msg *tg.Message, grouped ...*tg.Message) (int64, error) {
+	if len(grouped) > 0 {
+		total := int64(0)
+		for _, gm := range grouped {
+			m, ok := tmedia.GetMedia(gm)
+			if !ok {
+				return 0, errors.Errorf("can't get media from message %d", gm.ID)
+			}
+			total += m.Size
+		}
+
+		return total, nil
+	}
+
+	m, ok := tmedia.GetMedia(msg)
+	if !ok { // maybe it's a text only message
+		return 0, nil
+	}
+
+	return m.Size, nil
 }
